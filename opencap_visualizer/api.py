@@ -113,6 +113,98 @@ class OpenCapVisualizer:
             return all(c in '0123456789ABCDEFabcdef' for c in hex_part)
         else:
             return False
+    
+    def _categorize_files(self, input_files: List[str]) -> Dict[str, List[str]]:
+        """
+        Categorize input files by type.
+        
+        Args:
+            input_files: List of file paths
+            
+        Returns:
+            Dictionary with categorized file lists
+        """
+        categorized = {
+            'json': [],
+            'osim': [],
+            'mot': [],
+            'trc': [],
+            'force_mot': [],
+            'motion_mot': []
+        }
+        
+        for file_path in input_files:
+            file_lower = file_path.lower()
+            
+            if file_lower.endswith('.json'):
+                categorized['json'].append(file_path)
+            elif file_lower.endswith('.osim'):
+                categorized['osim'].append(file_path)
+            elif file_lower.endswith('.mot'):
+                # Check if it's a force file or motion file
+                if self._is_force_mot_file(file_path):
+                    categorized['force_mot'].append(file_path)
+                else:
+                    categorized['motion_mot'].append(file_path)
+            elif file_lower.endswith('.trc'):
+                categorized['trc'].append(file_path)
+        
+        return categorized
+    
+    def _is_force_mot_file(self, file_path: str) -> bool:
+        """
+        Check if a .mot file is a force file based on filename and content.
+        
+        Args:
+            file_path: Path to the .mot file
+            
+        Returns:
+            True if it's a force file, False otherwise
+        """
+        file_name = os.path.basename(file_path).lower()
+        
+        # First check: filename contains "force"
+        if 'force' in file_name:
+            return True
+        
+        # Second check: examine column headers
+        try:
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+            
+            header_ended = False
+            for line in lines:
+                line = line.strip()
+                
+                if line == 'endheader':
+                    header_ended = True
+                    continue
+                
+                if not header_ended:
+                    continue
+                
+                # This is the column headers line
+                column_headers = line.split()
+                
+                # Check for force-related column names
+                force_keywords = [
+                    'force', 'ground_force', 'grf',
+                    'force_vx', 'force_vy', 'force_vz',
+                    'force_px', 'force_py', 'force_pz',
+                    'moment', 'torque', 'cop'
+                ]
+                
+                has_force_columns = any(
+                    any(keyword in header.lower() for keyword in force_keywords)
+                    for header in column_headers
+                )
+                
+                return has_force_columns
+        
+        except Exception as e:
+            self._log(f"Warning: Could not read {file_path} to determine type: {e}")
+        
+        return False
 
     async def generate_video(
         self,
@@ -127,16 +219,29 @@ class OpenCapVisualizer:
         loops: int = 1,
         camera: Optional[str] = None,
         center_subjects: bool = True,
-        zoom: float = 1.5,
+        zoom: float = 0.8,
         colors: Optional[List[str]] = None,
-        interactive: bool = False
+        model: str = 'LaiArnold',
+        interactive: bool = False,
+        show_markers: bool = True,
+        show_forces: bool = True,
+        marker_size: float = 10.0,
+        force_scale: float = 0.001
     ) -> bool:
         """
         Generate a video from biomechanics data files.
         
         Args:
             input_files (str or list): Path(s) to data file(s). Can be a single file path
-                or list of file paths. Supports JSON files or pairs of .osim/.mot files.
+                or list of file paths. Supports:
+                - JSON files (pre-processed motion data)
+                - .osim + .mot pairs (OpenSim models with motion)
+                - .trc files (motion capture marker data) *
+                - .mot files (force/motion data - auto-detected) *
+                
+                * Note: .trc and standalone .mot file support is currently being integrated.
+                For full compatibility, use with JSON files or .osim/.mot pairs.
+                
             output_path (str): Output video file path. Default: "animation_video.mp4"
             vue_app_path (str, optional): Absolute path to built Vue app's index.html
             dev_server_url (str, optional): URL of custom Vue server
@@ -144,13 +249,20 @@ class OpenCapVisualizer:
             height (int): Video height in pixels. Default: 1080  
             timeout_seconds (int): Timeout in seconds for loading. Default: 120
             loops (int): Number of animation loops to record. Default: 1
+                Note: For short animations (<3 seconds), loops will be automatically 
+                increased to ensure a minimum 3-second video duration.
             camera (str, optional): Camera view position. Options include:
                 - Original views: 'top', 'bottom', 'front', 'back', 'left', 'right'
                 - Anatomical views: 'anterior', 'posterior', 'sagittal', 'superior', etc.
             center_subjects (bool): Enable automatic centering on subjects. Default: True
             zoom (float): Zoom factor (>1.0 zooms out, <1.0 zooms in). Default: 1.5
             colors (list, optional): Subject colors as hex strings or color names
+            model (str): Geometry model folder: 'LaiArnold' (default) or 'Hu_ISB_shoulder'
             interactive (bool): Open browser interactively (no recording). Default: False
+            show_markers (bool): Show markers from .trc files. Default: True
+            show_forces (bool): Show forces from .mot files. Default: True
+            marker_size (float): Size of marker spheres. Default: 10.0
+            force_scale (float): Scale factor for force arrows. Default: 0.001
             
         Returns:
             bool: True if successful, False otherwise
@@ -159,17 +271,27 @@ class OpenCapVisualizer:
             >>> visualizer = OpenCapVisualizer()
             >>> await visualizer.generate_video("data.json", "output.mp4")
             
+            >>> # OpenSim files (fully supported)
+            >>> await visualizer.generate_video(
+            ...     ["model.osim", "motion.mot"],
+            ...     "opensim_video.mp4",
+            ...     camera="anterior",
+            ...     loops=2
+            ... )
+            
+            >>> # Multiple JSON files for comparison
             >>> await visualizer.generate_video(
             ...     ["subject1.json", "subject2.json"],
             ...     "comparison.mp4",
-            ...     camera="anterior",
-            ...     colors=["red", "blue"],
-            ...     loops=2
+            ...     colors=["red", "blue"]
             ... )
         """
         # Convert single file to list
         if isinstance(input_files, str):
             input_files = [input_files]
+        
+        # Categorize files by type
+        categorized_files = self._categorize_files(input_files)
         
         # Import the actual implementation from cli module
         from .cli import VisualizerCLI
@@ -180,8 +302,31 @@ class OpenCapVisualizer:
         viewport_size = {"width": width, "height": height}
         timeout_ms = timeout_seconds * 1000
         
+        # Prepare file lists for the CLI
+        files_to_process = []
+        
+        # Add JSON files
+        files_to_process.extend(categorized_files['json'])
+        
+        # Add .osim/.mot pairs
+        if categorized_files['osim'] and categorized_files['motion_mot']:
+            # Combine .osim and .mot files (assuming they're paired in order)
+            min_pairs = min(len(categorized_files['osim']), len(categorized_files['motion_mot']))
+            for i in range(min_pairs):
+                files_to_process.extend([categorized_files['osim'][i], categorized_files['motion_mot'][i]])
+        
+        # Add standalone .trc and force .mot files
+        files_to_process.extend(categorized_files['trc'])
+        files_to_process.extend(categorized_files['force_mot'])
+        
+        # Note about automatic loop adjustment for short animations
+        if self.verbose and loops > 0:
+            self._log(f"Requested {loops} loop(s). Note: loops may be automatically increased for short animations to ensure minimum 3-second video duration.")
+        
+        # Use the CLI method (keeping existing name for compatibility)
+        # Note: show_markers, show_forces, marker_size, force_scale are handled by the Vue app
         return await cli.create_video_from_json(
-            json_file_paths=input_files,
+            json_file_paths=files_to_process,
             output_video_path=output_path,
             vue_app_path=vue_app_path,
             viewport_size=viewport_size,
@@ -192,6 +337,7 @@ class OpenCapVisualizer:
             center_subjects=center_subjects,
             zoom_factor=zoom,
             subject_colors=colors,
+            model_folder=model,
             interactive_mode=interactive,
             quiet_mode=not self.verbose
         )
@@ -219,6 +365,13 @@ class OpenCapVisualizer:
             >>> success = visualizer.generate_video_sync("data.json", "output.mp4")
             >>> if success:
             ...     print("Video generated successfully!")
+            
+                    >>> # With OpenSim files
+        >>> success = visualizer.generate_video_sync(
+        ...     ["model.osim", "motion.mot"],
+        ...     "opensim_video.mp4",
+        ...     camera="anterior"
+        ... )
         """
         return asyncio.run(self.generate_video(input_files, output_path, **kwargs))
 
@@ -241,6 +394,13 @@ async def create_video_async(
     Example:
         >>> import opencap_visualizer as ocv
         >>> await ocv.create_video_async("data.json", "output.mp4", camera="anterior")
+        
+        >>> # With OpenSim files
+        >>> await ocv.create_video_async(
+        ...     ["model.osim", "motion.mot"],
+        ...     "opensim_video.mp4",
+        ...     camera="anterior"
+        ... )
     """
     visualizer = OpenCapVisualizer(verbose=kwargs.pop('verbose', False))
     return await visualizer.generate_video(input_files, output_path, **kwargs)
@@ -263,6 +423,13 @@ def create_video(
     Example:
         >>> import opencap_visualizer as ocv
         >>> success = ocv.create_video("data.json", "output.mp4", camera="anterior")
+        
+        >>> # With OpenSim files
+        >>> success = ocv.create_video(
+        ...     ["model.osim", "motion.mot"],
+        ...     "opensim_video.mp4",
+        ...     camera="anterior"
+        ... )
     """
     visualizer = OpenCapVisualizer(verbose=kwargs.pop('verbose', False))
     return visualizer.generate_video_sync(input_files, output_path, **kwargs) 

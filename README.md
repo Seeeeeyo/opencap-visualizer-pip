@@ -12,6 +12,7 @@ This tool uses the deployed [OpenCap Visualizer](https://opencap-visualizer.onre
 - **Subject Comparison**: Generate videos with multiple subjects
 - **Anatomical Camera Views**: Use biomechanics-friendly camera angles
 - **Customizable**: Colors, zoom, centering, loops, and dimensions
+- **Geometry model selection**: Choose the S3 geometry set used for visualization (`LaiArnold` or `Hu_ISB_shoulder`), matching the web app’s model picker
 - **Automatic 3D Geometry**: Loads realistic human models from cloud storage
 
 ## Installation
@@ -41,6 +42,9 @@ opencap-visualizer data.json --camera anterior --colors red --loops 2 -o front_v
 
 # OpenSim files
 opencap-visualizer model.osim motion.mot -o simulation.mp4
+
+# Geometry model (must match the visualizer web app options)
+opencap-visualizer data.json --model Hu_ISB_shoulder -o shoulder_model.mp4
 ```
 
 ### Advanced Examples
@@ -70,6 +74,20 @@ opencap-visualizer data.json --interactive --camera anterior
 - `isometric`, `default`
 - Corner views: `frontTopRight`, `backBottomLeft`, etc.
 
+### Geometry model (`--model`)
+
+The web visualizer resolves mesh geometry from named folders on cloud storage. In headless mode, pick the model **before** loading data (same choices as the app’s “Select Model” dialog):
+
+| Value | Description |
+|-------|-------------|
+| `LaiArnold` | Default Lai Arnold full-body model |
+| `Hu_ISB_shoulder` | Hu ISB shoulder model |
+
+```bash
+opencap-visualizer trial.json --model LaiArnold -o out.mp4
+opencap-visualizer model.osim motion.mot --model Hu_ISB_shoulder -o out.mp4
+```
+
 ### Command Line Options
 
 ```
@@ -78,7 +96,8 @@ positional arguments:
 
 optional arguments:
   -o, --output PATH     Output video file (default: animation_video.mp4)
-  --camera VIEW         Camera position (default: isometric)
+  --camera VIEW         Camera preset (anatomical or technical; optional)
+  --model MODEL         Geometry folder: LaiArnold (default) or Hu_ISB_shoulder
   --colors COLOR...     Subject colors (hex or names: red, blue, #ff0000)
   --loops N             Animation loops to record (default: 1)
   --width PX            Video width (default: 1920)
@@ -109,6 +128,7 @@ success = ocv.create_video(
     ["subject1.json", "subject2.json"],
     "comparison.mp4", 
     camera="anterior",
+    model="LaiArnold",
     colors=["red", "blue"],
     loops=2,
     verbose=True
@@ -127,7 +147,8 @@ visualizer = ocv.OpenCapVisualizer(verbose=True)
 success = visualizer.generate_video_sync(
     input_files=["subject1.json", "subject2.json"],
     output_path="comparison.mp4",
-    camera="sagittal", 
+    camera="sagittal",
+    model="Hu_ISB_shoulder",
     colors=["#ff0000", "#00ff00"],
     width=1920,
     height=1080,
@@ -149,6 +170,7 @@ async def generate_videos():
         "data.json", 
         "output.mp4",
         camera="anterior",
+        model="LaiArnold",
         colors=["blue"]
     )
     
@@ -158,6 +180,7 @@ async def generate_videos():
         ["s1.json", "s2.json", "s3.json"],
         "triple_comparison.mp4",
         camera="posterior",
+        model="LaiArnold",
         colors=["red", "green", "blue"],
         center_subjects=True,
         zoom=1.5
@@ -190,8 +213,9 @@ class OpenCapVisualizer:
         loops: int = 1,
         camera: Optional[str] = None,
         center_subjects: bool = True,
-        zoom: float = 1.5,
+        zoom: float = 0.8,
         colors: Optional[List[str]] = None,
+        model: str = "LaiArnold",
         interactive: bool = False
     ) -> bool
     

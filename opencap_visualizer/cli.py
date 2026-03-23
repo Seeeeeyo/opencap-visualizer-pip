@@ -9,8 +9,17 @@ import os
 import sys
 import tempfile
 import json
+import time
 from pathlib import Path
 from playwright.async_api import async_playwright
+
+def get_version():
+    """Get version from __init__.py"""
+    try:
+        from . import __version__
+        return __version__
+    except ImportError:
+        return "unknown"
 
 # Configuration
 DEFAULT_OUTPUT_FILENAME = "animation_video.mp4"
@@ -97,8 +106,142 @@ class VisualizerCLI:
             return all(c in '0123456789ABCDEFabcdef' for c in hex_part)
         else:
             return False
+    
+    async def _capture_frame_by_frame(self, output_path: str, animation_frames: int, loop_count: int, frame_rate: int, viewport_size: dict, source_frame_rate: int = None) -> bool:
+        """
+        Capture animation frame-by-frame for guaranteed smooth video output.
         
-    async def create_video_from_json(self, json_file_paths: list, output_video_path: str, vue_app_path: str = None, viewport_size: dict = None, timeout_ms: int = None, dev_server_url: str = None, loop_count: int = 1, camera_view: str = None, center_subjects: bool = True, zoom_factor: float = 1.0, subject_colors: list = None, interactive_mode: bool = False, quiet_mode: bool = True):
+        This method steps through each frame of the animation, captures a screenshot,
+        and compiles all frames into a video using ffmpeg. This approach guarantees
+        smooth playback regardless of browser rendering performance.
+        
+        Args:
+            output_path: Path to save the output video
+            animation_frames: Total number of frames in the animation
+            loop_count: Number of times to loop the animation
+            frame_rate: Target frame rate for the output video
+            viewport_size: Dictionary with 'width' and 'height' keys
+            source_frame_rate: Original frame rate of the animation (for downsampling)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        import subprocess
+        import sys
+        
+        # Calculate how many frames we actually need to capture
+        # If source is 100fps but target is 30fps, we sample every ~3.33 frames
+        if source_frame_rate and source_frame_rate > frame_rate:
+            # Downsample: calculate animation duration and target frame count
+            animation_duration = animation_frames / source_frame_rate
+            frames_per_loop = int(animation_duration * frame_rate)
+            total_output_frames = frames_per_loop * loop_count
+            frame_step = animation_frames / frames_per_loop  # How many source frames to skip
+            self._log(f"Downsampling from {source_frame_rate}fps to {frame_rate}fps: {animation_frames} source frames -> {frames_per_loop} output frames per loop")
+        else:
+            frames_per_loop = animation_frames
+            total_output_frames = animation_frames * loop_count
+            frame_step = 1.0
+        
+        self._log(f"Starting frame-by-frame capture: {total_output_frames} frames ({frames_per_loop} frames x {loop_count} loops) at {frame_rate} fps")
+        sys.stdout.flush()  # Ensure output is visible
+        
+        # Create a temporary directory for frames
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._log(f"Capturing frames to temporary directory...")
+            sys.stdout.flush()
+            
+            # Ensure animation is paused and at frame 0
+            await self.page.evaluate("""
+                window.sessionComponent.playing = false;
+                window.sessionComponent.frame = 0;
+                window.sessionComponent.animateOneFrame();
+            """)
+            
+            # Wait for initial render
+            await asyncio.sleep(0.1)
+            
+            start_time = time.time()
+            
+            # Capture each frame
+            for i in range(total_output_frames):
+                # Calculate which source frame to show (handles downsampling and looping)
+                loop_frame = i % frames_per_loop
+                source_frame = int(loop_frame * frame_step) % animation_frames
+                
+                # Set the frame and force render
+                await self.page.evaluate(f"""
+                    window.sessionComponent.frame = {source_frame};
+                    window.sessionComponent.animateOneFrame();
+                    // Force a synchronous render
+                    if (window.sessionComponent.renderer && window.sessionComponent.scene && window.sessionComponent.camera) {{
+                        window.sessionComponent.renderer.render(window.sessionComponent.scene, window.sessionComponent.camera);
+                    }}
+                """)
+                
+                # Capture screenshot (no delay needed - screenshot waits for render)
+                frame_path = os.path.join(temp_dir, f"frame_{i:05d}.png")
+                await self.page.screenshot(path=frame_path, type='png')
+                
+                # Progress logging every 10% 
+                if (i + 1) % max(1, total_output_frames // 10) == 0:
+                    progress = (i + 1) / total_output_frames * 100
+                    elapsed = time.time() - start_time
+                    fps = (i + 1) / elapsed if elapsed > 0 else 0
+                    eta = (total_output_frames - i - 1) / fps if fps > 0 else 0
+                    self._log(f"  Captured frame {i + 1}/{total_output_frames} ({progress:.0f}%) - {fps:.1f} frames/sec, ETA: {eta:.0f}s")
+                    sys.stdout.flush()
+            
+            elapsed_total = time.time() - start_time
+            self._log(f"All {total_output_frames} frames captured in {elapsed_total:.1f}s. Compiling video with ffmpeg...")
+            
+            # Determine output format
+            output_ext = Path(output_path).suffix.lower()
+            
+            # Build ffmpeg command
+            if output_ext == '.mp4':
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',
+                    '-framerate', str(frame_rate),
+                    '-i', os.path.join(temp_dir, 'frame_%05d.png'),
+                    '-c:v', 'libx264',
+                    '-crf', '18',  # High quality (lower = better, 18 is visually lossless)
+                    '-preset', 'medium',
+                    '-pix_fmt', 'yuv420p',  # Required for compatibility
+                    '-movflags', '+faststart',  # Enable fast start for web playback
+                    output_path
+                ]
+            else:  # WebM
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',
+                    '-framerate', str(frame_rate),
+                    '-i', os.path.join(temp_dir, 'frame_%05d.png'),
+                    '-c:v', 'libvpx-vp9',
+                    '-crf', '30',
+                    '-b:v', '0',
+                    output_path
+                ]
+            
+            try:
+                result = subprocess.run(
+                    ffmpeg_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                self._log(f"Video compiled successfully: {output_path}")
+                return True
+                
+            except FileNotFoundError:
+                self._log("Error: ffmpeg not found. Please install ffmpeg to use frame-by-frame capture.")
+                self._log("Install with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)")
+                return False
+                
+            except subprocess.CalledProcessError as e:
+                self._log(f"Error compiling video with ffmpeg: {e.stderr}")
+                return False
+        
+    async def create_video_from_json(self, json_file_paths: list, output_video_path: str, vue_app_path: str = None, viewport_size: dict = None, timeout_ms: int = None, dev_server_url: str = None, loop_count: int = 1, camera_view: str = None, center_subjects: bool = True, zoom_factor: float = 1.0, subject_colors: list = None, model_folder: str = 'LaiArnold', interactive_mode: bool = False, quiet_mode: bool = True):
         """
         Main function to launch browser, load data files, and record video or open interactively.
         """
@@ -128,60 +271,24 @@ class VisualizerCLI:
                 app_url = f"file://{vue_app_path}{url_param}"
                 self._log(f"Using Vue app file at: {vue_app_path}")
             else:
-                # Try deployed version first, then local development server, then built files
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
                     try:
-                        # First try the deployed version
                         async with session.get("https://opencap-visualizer.onrender.com/", timeout=10) as response:
                             if response.status == 200:
                                 url_param = "" if interactive_mode else "?headless=true"
-                                app_url = f"https://opencap-visualizer.onrender.com/{url_param}"
+                                # Add aggressive cache-busting parameters to force fresh load
+                                import random
+                                timestamp = int(time.time())
+                                random_id = random.randint(1000, 9999)
+                                cache_buster = f"&_t={timestamp}&_r={random_id}" if url_param else f"?_t={timestamp}&_r={random_id}"
+                                app_url = f"https://opencap-visualizer.onrender.com{url_param}{cache_buster}"
                                 self._log("Using deployed OpenCap Visualizer at: https://opencap-visualizer.onrender.com/")
                             else:
                                 raise aiohttp.ClientError("Deployed server not responding correctly")
                     except (aiohttp.ClientError, asyncio.TimeoutError):
-                        self._log("Deployed version not available, trying local development server...")
+                        self._log("Issue with deployed server.")
                         
-                        try:
-                            # Fall back to local development server
-                            async with session.get("http://localhost:3000", timeout=5) as response:
-                                if response.status == 200:
-                                    url_param = "" if interactive_mode else "?headless=true"
-                                    app_url = f"http://localhost:3000{url_param}"
-                                    self._log("Found local Vue development server at: http://localhost:3000")
-                                else:
-                                    raise aiohttp.ClientError("Local server not responding correctly")
-                        except (aiohttp.ClientError, asyncio.TimeoutError):
-                            self._log("Local development server not found, trying built files...")
-                            
-                            # Final fallback to built files
-                            script_dir = Path(__file__).parent.absolute()
-                            possible_paths = [
-                                script_dir / "dist" / "index.html",
-                                script_dir / "public" / "index.html",
-                                script_dir / ".." / "dist" / "index.html",
-                            ]
-                            
-                            app_index_path = None
-                            for path in possible_paths:
-                                if path.exists():
-                                    app_index_path = str(path.absolute())
-                                    break
-                            
-                            if not app_index_path:
-                                self._log("Error: Could not find Vue app")
-                                self._log("Please either:")
-                                self._log("  1. Check your internet connection for the deployed version")
-                                self._log("  2. Start the Vue dev server with 'npm run serve'")
-                                self._log("  3. Build the Vue app with 'npm run build'")
-                                self._log("  4. Specify --vue-app-path or --dev-server-url")
-                                self._log(f"Searched for built files in: {[str(p) for p in possible_paths]}")
-                                return False
-                            
-                            url_param = "" if interactive_mode else "?headless=true"
-                            app_url = f"file://{app_index_path}{url_param}"
-                            self._log(f"Using built Vue app at: {app_index_path}")
             
             if not app_url:
                 self._log("Error: Could not determine Vue app URL")
@@ -198,7 +305,20 @@ class VisualizerCLI:
                             '--disable-features=VizDisplayCompositor',
                             '--allow-file-access-from-files',
                             '--disable-dev-shm-usage',
-                            '--no-sandbox'
+                            '--no-sandbox',
+                            '--disable-background-timer-throttling',
+                            '--disable-renderer-backgrounding',
+                            '--disable-backgrounding-occluded-windows',
+                            '--disable-ipc-flooding-protection',
+                            '--max_old_space_size=4096',
+                            '--disable-application-cache',
+                            '--disable-cache',
+                            '--disable-offline-load-stale-cache',
+                            '--disk-cache-size=0',
+                            '--media-cache-size=0',
+                            # Additional flags for smooth frame capture
+                            '--disable-frame-rate-limit',
+                            '--disable-gpu-vsync'
                         ]
                     )
                 else:
@@ -210,19 +330,38 @@ class VisualizerCLI:
                             '--disable-features=VizDisplayCompositor',
                             '--allow-file-access-from-files',
                             '--disable-dev-shm-usage',
-                            '--no-sandbox'
+                            '--no-sandbox',
+                            '--disable-background-timer-throttling',
+                            '--disable-renderer-backgrounding',
+                            '--disable-backgrounding-occluded-windows',
+                            '--disable-ipc-flooding-protection',
+                            '--max_old_space_size=4096',
+                            '--disable-application-cache',
+                            '--disable-cache',
+                            '--disable-offline-load-stale-cache',
+                            '--disk-cache-size=0',
+                            '--media-cache-size=0',
+                            # Additional flags for smooth frame capture
+                            '--disable-frame-rate-limit',
+                            '--disable-gpu-vsync',
+                            '--run-all-compositor-stages-before-draw',
+                            '--disable-threaded-animation',
+                            '--disable-threaded-scrolling',
+                            '--disable-checker-imaging'
                         ]
                     )
                 
-                # Create page (with or without video recording)
-                if interactive_mode:
-                    context = await self.browser.new_context(viewport=viewport_size)
-                else:
-                    context = await self.browser.new_context(
-                        viewport=viewport_size,
-                        record_video_dir=str(Path(output_video_path).parent),
-                        record_video_size=viewport_size
-                    )
+                # Create page context with optimized settings for smooth recording
+                context = await self.browser.new_context(
+                    viewport=viewport_size,
+                    # Optimize for smooth video recording
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache'
+                    }
+                )
                 self.page = await context.new_page()
                 
                 # Enable console logging for debugging, only if in verbose mode
@@ -261,6 +400,7 @@ class VisualizerCLI:
                 json_files = [f for f in json_file_paths if f.lower().endswith('.json')]
                 osim_files = [f for f in json_file_paths if f.lower().endswith('.osim')]
                 mot_files = [f for f in json_file_paths if f.lower().endswith('.mot')]
+                trc_files = [f for f in json_file_paths if f.lower().endswith('.trc')]
                 
                 # Validate JSON files
                 for json_file_path in json_files:
@@ -277,13 +417,11 @@ class VisualizerCLI:
                         self._log(f"Warning: Invalid JSON file {json_file_path}: {e}. Skipping.")
                         continue
                 
+                # Initialize standalone mot files list
+                standalone_mot_files = []
+                
                 # Validate .osim/.mot file pairs
                 if osim_files or mot_files:
-                    if len(osim_files) != len(mot_files):
-                        self._log(f"Error: Found {len(osim_files)} .osim files and {len(mot_files)} .mot files.")
-                        self._log("Each .osim file must be paired with exactly one .mot file.")
-                        return False
-                    
                     # Check that all files exist
                     for osim_file in osim_files:
                         if not os.path.exists(osim_file):
@@ -295,18 +433,50 @@ class VisualizerCLI:
                             self._log(f"Error: .mot file not found: {mot_file}")
                             return False
                     
-                    # Create pairs (assume they're in the same order as provided)
-                    for i in range(len(osim_files)):
-                        pair = {'osim': osim_files[i], 'mot': mot_files[i]}
-                        osim_mot_pairs.append(pair)
-                        self._log(f"Validated .osim/.mot pair: {os.path.basename(osim_files[i])} + {os.path.basename(mot_files[i])}")
+                    # Handle .osim/.mot pairs
+                    if osim_files and mot_files:
+                        if len(osim_files) != len(mot_files):
+                            self._log(f"Error: Found {len(osim_files)} .osim files and {len(mot_files)} .mot files.")
+                            self._log("Each .osim file must be paired with exactly one .mot file.")
+                            return False
+                        
+                        # Create pairs (assume they're in the same order as provided)
+                        for i in range(len(osim_files)):
+                            pair = {'osim': osim_files[i], 'mot': mot_files[i]}
+                            osim_mot_pairs.append(pair)
+                            self._log(f"Validated .osim/.mot pair: {os.path.basename(osim_files[i])} + {os.path.basename(mot_files[i])}")
+                    
+                    # Handle standalone .mot files (force data)
+                    if mot_files and not osim_files:
+                        standalone_mot_files = mot_files
+                        for mot_file in standalone_mot_files:
+                            self._log(f"Validated standalone .mot file (force data): {os.path.basename(mot_file)}")
+                    
+                    # Handle standalone .osim files (should be paired with .mot)
+                    if osim_files and not mot_files:
+                        self._log(f"Error: Found {len(osim_files)} .osim files but no .mot files.")
+                        self._log("Each .osim file must be paired with exactly one .mot file.")
+                        return False
 
-                if not valid_files and not osim_mot_pairs:
+                # Validate .trc files (marker data)
+                trc_files_valid = []
+                for trc_file_path in trc_files:
+                    if not os.path.exists(trc_file_path):
+                        self._log(f"Warning: .trc file not found: {trc_file_path}. Skipping.")
+                        continue
+                    trc_files_valid.append(trc_file_path)
+                    self._log(f"Validated .trc file (marker data): {trc_file_path}")
+                
+                if not valid_files and not osim_mot_pairs and not trc_files_valid and not standalone_mot_files:
                     self._log("Error: No valid input files found.")
                     return False
                 
                 total_subjects = len(valid_files) + len(osim_mot_pairs)
                 self._log(f"Total subjects to visualize: {total_subjects} ({len(valid_files)} JSON, {len(osim_mot_pairs)} .osim/.mot pairs)")
+                if trc_files_valid:
+                    self._log(f"Additional marker files: {len(trc_files_valid)} .trc files")
+                if standalone_mot_files:
+                    self._log(f"Additional force files: {len(standalone_mot_files)} .mot files")
                 
                 # Process and validate subject colors
                 processed_colors = None
@@ -337,7 +507,9 @@ class VisualizerCLI:
                     # Inject JSON files
                     try:
                         await self.page.evaluate("""
-                            async (fileDataArray) => {
+                            async (payload) => {
+                                const fileDataArray = payload.fileDataArray;
+                                const modelFolderName = payload.modelFolderName;
                                 // Reset any previous state
                                 if (window.allVisualsLoaded) {
                                     delete window.allVisualsLoaded;
@@ -349,22 +521,33 @@ class VisualizerCLI:
                                     return new File([blob], fileData.name, { type: fileData.type });
                                 });
                                 
-                                // Call handleFileUpload on the Session component
                                 const sessionComponent = window.sessionComponent;
                                 if (!sessionComponent) {
                                     throw new Error('Session component not found');
                                 }
                                 
-                                sessionComponent.handleFileUpload({ 
-                                    target: { 
-                                        files: files,
-                                        value: '' // Reset input value
-                                    } 
-                                });
+                                // Pre-set the chosen model so the model selection dialog is bypassed
+                                const modelChoice = sessionComponent.modelChoices.find(
+                                    m => m.folder_name === modelFolderName && m.enabled
+                                );
+                                if (modelChoice) {
+                                    sessionComponent.selectedModelForImport = modelChoice;
+                                    sessionComponent.selectedModelFolder = modelChoice.folder_name;
+                                }
+                                
+                                sessionComponent.handleFileUpload(
+                                    {
+                                        target: {
+                                            files: files,
+                                            value: ''
+                                        }
+                                    },
+                                    { skipModelSelection: true }
+                                );
                                 
                                 return files.length;
                             }
-                        """, file_data)
+                        """, {"fileDataArray": file_data, "modelFolderName": model_folder})
                         
                         self._log(f"Successfully loaded {len(file_data)} JSON files.")
                         
@@ -395,6 +578,15 @@ class VisualizerCLI:
                                         throw new Error('Session component not found');
                                     }
                                     
+                                    // Pre-set geometry model before conversion / post-conversion upload
+                                    const modelChoice = sessionComponent.modelChoices.find(
+                                        m => m.folder_name === fileData.modelFolderName && m.enabled
+                                    );
+                                    if (modelChoice) {
+                                        sessionComponent.selectedModelForImport = modelChoice;
+                                        sessionComponent.selectedModelFolder = modelChoice.folder_name;
+                                    }
+                                    
                                     // Create File objects for .osim and .mot
                                     const osimBlob = new Blob([fileData.osim.content], { type: 'text/plain' });
                                     const motBlob = new Blob([fileData.mot.content], { type: 'text/plain' });
@@ -417,7 +609,7 @@ class VisualizerCLI:
                                         const originalHandleFileUpload = sessionComponent.handleFileUpload;
                                         sessionComponent.handleFileUpload = function(event) {
                                             console.log('[Headless] Conversion completed, loading JSON...');
-                                            const result = originalHandleFileUpload.call(this, event);
+                                            const result = originalHandleFileUpload.call(this, event, { skipModelSelection: true });
                                             // Restore original handler
                                             sessionComponent.handleFileUpload = originalHandleFileUpload;
                                             resolve(true);
@@ -454,7 +646,8 @@ class VisualizerCLI:
                                 'mot': {
                                     'name': os.path.basename(pair['mot']),
                                     'content': mot_content
-                                }
+                                },
+                                'modelFolderName': model_folder,
                             }), timeout=120.0)  # 2 minute timeout for conversion
                             
                             self._log(f"Successfully converted and loaded pair {i+1}")
@@ -464,6 +657,104 @@ class VisualizerCLI:
                             
                         except Exception as e:
                             self._log(f"Error processing .osim/.mot pair {i+1}: {e}")
+                            return False
+
+                # Process standalone .trc files (marker data)
+                if trc_files_valid:
+                    self._log(f"Loading {len(trc_files_valid)} .trc marker files...")
+                    for i, trc_file_path in enumerate(trc_files_valid):
+                        try:
+                            self._log(f"Loading marker file {i+1}/{len(trc_files_valid)}: {os.path.basename(trc_file_path)}")
+                            
+                            # Read file content
+                            with open(trc_file_path, 'r') as f:
+                                trc_content = f.read()
+                            
+                            # Load the .trc file using Session.vue's marker loading
+                            await self.page.evaluate("""
+                                async (fileData) => {
+                                    const sessionComponent = window.sessionComponent;
+                                    if (!sessionComponent) {
+                                        throw new Error('Session component not found');
+                                    }
+                                    
+                                    // Create a File object from the content
+                                    const blob = new Blob([fileData.content], { type: 'text/plain' });
+                                    const file = new File([blob], fileData.name, { type: 'text/plain' });
+                                    
+                                    // Set as marker file
+                                    sessionComponent.markersFile = file;
+                                    
+                                    // Load the marker file
+                                    if (sessionComponent.loadMarkersFile) {
+                                        await sessionComponent.loadMarkersFile();
+                                    } else {
+                                        throw new Error('loadMarkersFile function not found');
+                                    }
+                                    
+                                    return true;
+                                }
+                            """, {
+                                'name': os.path.basename(trc_file_path),
+                                'content': trc_content
+                            })
+                            
+                            self._log(f"Successfully loaded marker file {i+1}")
+                            
+                            # Wait a moment between files
+                            await asyncio.sleep(1.0)
+                            
+                        except Exception as e:
+                            self._log(f"Error loading .trc file {i+1}: {e}")
+                            return False
+
+                # Process standalone .mot files (force data)
+                if standalone_mot_files:
+                    self._log(f"Loading {len(standalone_mot_files)} standalone .mot force files...")
+                    for i, mot_file_path in enumerate(standalone_mot_files):
+                        try:
+                            self._log(f"Loading force file {i+1}/{len(standalone_mot_files)}: {os.path.basename(mot_file_path)}")
+                            
+                            # Read file content
+                            with open(mot_file_path, 'r') as f:
+                                mot_content = f.read()
+                            
+                            # Load the .mot file using Session.vue's force loading
+                            await self.page.evaluate("""
+                                async (fileData) => {
+                                    const sessionComponent = window.sessionComponent;
+                                    if (!sessionComponent) {
+                                        throw new Error('Session component not found');
+                                    }
+                                    
+                                    // Create a File object from the content
+                                    const blob = new Blob([fileData.content], { type: 'text/plain' });
+                                    const file = new File([blob], fileData.name, { type: 'text/plain' });
+                                    
+                                    // Set as force file
+                                    sessionComponent.forcesFile = file;
+                                    
+                                    // Load the force file
+                                    if (sessionComponent.loadForcesFile) {
+                                        await sessionComponent.loadForcesFile();
+                                    } else {
+                                        throw new Error('loadForcesFile function not found');
+                                    }
+                                    
+                                    return true;
+                                }
+                            """, {
+                                'name': os.path.basename(mot_file_path),
+                                'content': mot_content
+                            })
+                            
+                            self._log(f"Successfully loaded force file {i+1}")
+                            
+                            # Wait a moment between files
+                            await asyncio.sleep(1.0)
+                            
+                        except Exception as e:
+                            self._log(f"Error loading .mot file {i+1}: {e}")
                             return False
 
                 # Wait for all visuals to load
@@ -594,21 +885,7 @@ class VisualizerCLI:
                 # Wait a moment for the reset to take effect
                 await asyncio.sleep(0.5)
                 
-                # Configure recording settings
-                await self.page.evaluate(f"""
-                    // Set recording for specified number of loops
-                    window.sessionComponent.loopCount = {loop_count};
-                    window.sessionComponent.currentLoop = 0;
-                    
-                    // Always use WebM for recording (for better browser compatibility)
-                    // We'll convert to MP4 with proper H.264 codec using ffmpeg if needed
-                    window.sessionComponent.recordingFormat = 'webm';
-                    
-                    console.log('[Headless] Configured recording: {loop_count} loop(s), webm format');
-                    console.log('[Headless] Current frame:', window.sessionComponent.frame);
-                    console.log('[Headless] Total frames:', window.sessionComponent.frames.length);
-                    console.log('[Headless] Frame rate:', window.sessionComponent.frameRate);
-                """)
+                # Note: Recording settings will be configured later after duration check
                 
                 # Check if we have valid frame data
                 frame_info = await self.page.evaluate("""
@@ -629,8 +906,28 @@ class VisualizerCLI:
                     self._log("Error: No animation frames loaded")
                     return False
                 
-                expected_duration = (frame_info['totalFrames'] / frame_info['frameRate']) * loop_count
+                # Calculate animation duration and ensure minimum video length
+                animation_duration = frame_info['totalFrames'] / frame_info['frameRate']
+                minimum_duration = 3.0  # Minimum 3 seconds for a useful video
+                
+                # Automatically increase loops if animation is too short
+                if animation_duration * loop_count < minimum_duration:
+                    original_loop_count = loop_count
+                    loop_count = max(loop_count, int(minimum_duration / animation_duration) + 1)
+                    self._log(f"Animation duration: {animation_duration:.2f}s is short. Increasing loops from {original_loop_count} to {loop_count} for minimum {minimum_duration}s video")
+                
+                expected_duration = animation_duration * loop_count
                 self._log(f"Expected recording duration: {expected_duration:.2f} seconds for {loop_count} loop(s)")
+                
+                # Configure the final loop count in the browser (after any adjustments)
+                # NOTE: Session.vue has a bug where it records (loopCount - 1) loops due to currentLoop starting at 1
+                # and stopping when currentLoop >= loopCount. We compensate by adding 1 to the requested loops.
+                actual_loop_count = loop_count + 1
+                await self.page.evaluate(f"""
+                    console.log('[Headless] Setting loop count to: {actual_loop_count} (requested: {loop_count}, +1 to compensate for Session.vue bug)');
+                    window.sessionComponent.loopCount = {actual_loop_count};
+                    window.sessionComponent.currentLoop = 0;
+                """)
                 
                 # Center camera on subjects first (if requested)
                 if center_subjects:
@@ -641,39 +938,50 @@ class VisualizerCLI:
                             await self.page.evaluate("""
                                 // Center on all animations by calculating combined bounding box
                                 if (window.sessionComponent.animations.length > 0) {
-                                    const boundingBox = new THREE.Box3();
+                                    // Access THREE through the scene or camera object (THREE is not global)
+                                    const THREE = window.THREE || (window.sessionComponent.camera && window.sessionComponent.camera.constructor.prototype.constructor.__proto__.constructor);
                                     
-                                    window.sessionComponent.animations.forEach((animation, index) => {
-                                        const meshKeys = Object.keys(window.sessionComponent.meshes)
-                                            .filter(key => key.startsWith(`anim${index}_`));
+                                    // Fallback: use the existing centerCameraOnAnimation for each animation
+                                    // and average the positions
+                                    if (!THREE || !THREE.Box3) {
+                                        // Use built-in centering for first subject as fallback
+                                        window.sessionComponent.centerCameraOnAnimation(0);
+                                        console.log('[Headless] Using fallback centering on first subject (THREE not accessible)');
+                                    } else {
+                                        const boundingBox = new THREE.Box3();
                                         
-                                        meshKeys.forEach(key => {
-                                            const mesh = window.sessionComponent.meshes[key];
-                                            if (mesh && mesh.visible) {
-                                                boundingBox.expandByObject(mesh);
-                                            }
+                                        window.sessionComponent.animations.forEach((animation, index) => {
+                                            const meshKeys = Object.keys(window.sessionComponent.meshes)
+                                                .filter(key => key.startsWith(`anim${index}_`));
+                                            
+                                            meshKeys.forEach(key => {
+                                                const mesh = window.sessionComponent.meshes[key];
+                                                if (mesh && mesh.visible) {
+                                                    boundingBox.expandByObject(mesh);
+                                                }
+                                            });
                                         });
-                                    });
-                                    
-                                    if (!boundingBox.isEmpty()) {
-                                        const center = new THREE.Vector3();
-                                        boundingBox.getCenter(center);
                                         
-                                        const size = new THREE.Vector3();
-                                        boundingBox.getSize(size);
-                                        const maxDim = Math.max(size.x, size.y, size.z);
-                                        const fov = window.sessionComponent.camera.fov * (Math.PI / 180);
-                                        const distance = Math.abs(maxDim / Math.sin(fov / 2)) * 1.5;
-                                        
-                                        const direction = new THREE.Vector3(1, 1, 1).normalize();
-                                        const position = center.clone().add(direction.multiplyScalar(distance));
-                                        
-                                        window.sessionComponent.controls.target.copy(center);
-                                        window.sessionComponent.camera.position.copy(position);
-                                        window.sessionComponent.controls.update();
-                                        window.sessionComponent.renderer.render(window.sessionComponent.scene, window.sessionComponent.camera);
-                                        
-                                        console.log('[Headless] Centered camera on all subjects');
+                                        if (!boundingBox.isEmpty()) {
+                                            const center = new THREE.Vector3();
+                                            boundingBox.getCenter(center);
+                                            
+                                            const size = new THREE.Vector3();
+                                            boundingBox.getSize(size);
+                                            const maxDim = Math.max(size.x, size.y, size.z);
+                                            const fov = window.sessionComponent.camera.fov * (Math.PI / 180);
+                                            const distance = Math.abs(maxDim / Math.sin(fov / 2)) * 1.5;
+                                            
+                                            const direction = new THREE.Vector3(1, 1, 1).normalize();
+                                            const position = center.clone().add(direction.multiplyScalar(distance));
+                                            
+                                            window.sessionComponent.controls.target.copy(center);
+                                            window.sessionComponent.camera.position.copy(position);
+                                            window.sessionComponent.controls.update();
+                                            window.sessionComponent.renderer.render(window.sessionComponent.scene, window.sessionComponent.camera);
+                                            
+                                            console.log('[Headless] Centered camera on all subjects');
+                                        }
                                     }
                                 }
                             """)
@@ -805,114 +1113,27 @@ class VisualizerCLI:
                 """)
                 self._log(f"Final camera state before recording - Distance: {final_camera_state['distance']:.2f}")
                 
-                # Start recording using Session.vue's built-in method
-                await self.page.evaluate("window.sessionComponent.startRecording()")
-                self._log("Started recording using Session.vue's built-in recording system...")
+                # Use frame-by-frame capture for guaranteed smooth video output
+                # This approach captures each frame as a screenshot and compiles with ffmpeg,
+                # avoiding the frame rate issues with MediaRecorder in headless mode
+                animation_frames = frame_info['totalFrames']
+                source_frame_rate = frame_info['frameRate']
+                target_frame_rate = min(source_frame_rate, 30)  # Cap at 30fps for reasonable file size
                 
-                # Monitor recording progress
-                start_time = asyncio.get_event_loop().time()
+                self._log(f"Using frame-by-frame capture for smooth video output...")
                 
-                # Wait for recording to complete (with timeout)
-                try:
-                    await self.page.wait_for_function(
-                        "window.recordingCompleted === true", 
-                        timeout=max(timeout_ms, int(expected_duration * 1000) + 30000)  # At least expected duration + 30s buffer
-                    )
-                    
-                    elapsed_time = asyncio.get_event_loop().time() - start_time
-                    self._log(f"Recording completed successfully in {elapsed_time:.2f} seconds!")
-                    
-                except Exception as e:
-                    elapsed_time = asyncio.get_event_loop().time() - start_time
-                    self._log(f"Timeout waiting for recording to complete after {elapsed_time:.2f} seconds: {e}")
-                    
-                    # Check current state for debugging
-                    current_state = await self.page.evaluate("""
-                        ({
-                            isRecording: window.sessionComponent.isRecording,
-                            isPlaying: window.sessionComponent.playing,
-                            currentFrame: window.sessionComponent.frame,
-                            currentLoop: window.sessionComponent.currentLoop,
-                            loopCount: window.sessionComponent.loopCount,
-                            recordingCompleted: window.recordingCompleted
-                        })
-                    """)
-                    self._log(f"Current state: {current_state}")
-                    
-                    # Try to stop recording gracefully
-                    await self.page.evaluate("window.sessionComponent.stopRecording()")
+                success = await self._capture_frame_by_frame(
+                    output_path=output_video_path,
+                    animation_frames=animation_frames,
+                    loop_count=loop_count,
+                    frame_rate=target_frame_rate,
+                    viewport_size=viewport_size,
+                    source_frame_rate=source_frame_rate
+                )
+                
+                if not success:
+                    self._log("Frame-by-frame capture failed")
                     return False
-                
-                # Download the recorded video blob
-                try:
-                    blob_url = await self.page.evaluate("window.recordingBlobUrl")
-                    if not blob_url:
-                        self._log("Error: No recording blob URL found")
-                        return False
-                    
-                    self._log("Downloading recorded video...")
-                    
-                    # Download the blob as a file
-                    async with self.page.expect_download() as download_info:
-                        await self.page.evaluate(f"""
-                            // Create a temporary download link
-                            const a = document.createElement('a');
-                            a.href = '{blob_url}';
-                            a.download = 'recorded_video.webm';
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                        """)
-                    
-                    download = await download_info.value
-                    
-                    # Save the file with proper format handling
-                    if output_video_path.endswith('.mp4'):
-                        # Save as webm first, then convert to proper MP4 with H.264
-                        temp_webm_path = output_video_path.replace('.mp4', '_temp.webm')
-                        await download.save_as(temp_webm_path)
-                        
-                        # Convert to proper MP4 with H.264 codec using ffmpeg
-                        try:
-                            import subprocess
-                            result = subprocess.run([
-                                'ffmpeg', '-i', temp_webm_path, 
-                                '-c:v', 'libx264', '-crf', '23', 
-                                '-preset', 'medium', '-pix_fmt', 'yuv420p',
-                                '-y', output_video_path
-                            ], check=True, capture_output=True)
-                            
-                            # Clean up temp file after successful conversion
-                            Path(temp_webm_path).unlink()
-                            self._log(f"Video saved as: {output_video_path} (converted to H.264 MP4)")
-                            
-                        except FileNotFoundError:
-                            # ffmpeg not installed - save as webm instead
-                            Path(temp_webm_path).unlink()
-                            webm_path = output_video_path.replace('.mp4', '.webm')
-                            await download.save_as(webm_path)
-                            self._log(f"Video saved as: {webm_path} (WebM format - install ffmpeg for MP4)")
-                            
-                        except subprocess.CalledProcessError as e:
-                            # ffmpeg failed - save as webm instead
-                            Path(temp_webm_path).unlink()
-                            webm_path = output_video_path.replace('.mp4', '.webm')
-                            await download.save_as(webm_path)
-                            self._log(f"Video saved as: {webm_path} (WebM format - ffmpeg conversion failed)")
-                            stderr_output = e.stderr.decode() if e.stderr else 'Unknown error'
-                            self._log(f"ffmpeg error: {stderr_output}")
-                            
-                    else:
-                        # Save directly as webm
-                        await download.save_as(output_video_path)
-                        self._log(f"Video saved as: {output_video_path}")
-                
-                except Exception as e:
-                    self._log(f"Error downloading video: {e}")
-                    return False
-                finally:
-                    # Clean up blob URL
-                    await self.page.evaluate("URL.revokeObjectURL(window.recordingBlobUrl)")
                 
                 # Close browser
                 await context.close()
@@ -1008,7 +1229,7 @@ No local setup required!
         "--loops",
         type=int,
         default=1,
-        help="Number of animation loops to record (default: 1)"
+        help="Number of animation loops to record (default: 1). Note: For short animations (<3 seconds), loops will be automatically increased to ensure minimum 3-second video duration."
     )
     
     parser.add_argument(
@@ -1050,11 +1271,26 @@ No local setup required!
     )
     
     parser.add_argument(
+        "--model",
+        type=str,
+        choices=['LaiArnold', 'Hu_ISB_shoulder'],
+        default='LaiArnold',
+        help="Geometry model folder to use. Options: LaiArnold (default), Hu_ISB_shoulder"
+    )
+    
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help="Open browser in interactive mode (non-headless) for manual exploration. No video recording will occur."
     )
 
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_version()}",
+        help="Show program's version number and exit"
+    )
+    
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
@@ -1096,6 +1332,7 @@ No local setup required!
             center_subjects=not args.no_center,
             zoom_factor=args.zoom,
             subject_colors=args.colors,
+            model_folder=args.model,
             interactive_mode=args.interactive,
             quiet_mode=(not args.verbose)
         ))
