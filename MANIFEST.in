@@ -2,6 +2,8 @@ include README.md
 include LICENSE
 include requirements.txt
 include CHANGELOG.md
+include TESTING.md
+recursive-include examples *.py
 recursive-include opencap_visualizer *.py
 global-exclude __pycache__
 global-exclude *.py[co] 

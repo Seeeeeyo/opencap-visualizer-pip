@@ -8,7 +8,7 @@ dynamic = ["version"]
 authors = [
     {name = "Selim Gilon", email = "selim.gilon@utah.edu"},
 ]
-description = "Tool for creating videos from OpenCap biomechanics data with both CLI and Python API"
+description = "Tool for creating videos and live WebSocket streaming from OpenCap biomechanics data (CLI and Python API)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.7"
@@ -36,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+live = [
+    "websockets>=10.0",
+]
 dev = [
     "pytest>=6.0",
     "black>=22.0",
@@ -55,6 +58,8 @@ ffmpeg = [
 [project.scripts]
 opencap-visualizer = "opencap_visualizer.cli:main"
 opencap-viz = "opencap_visualizer.cli:main"
+opencap-visualizer-stream = "opencap_visualizer.live_stream:main"
+opencap-viz-stream = "opencap_visualizer.live_stream:main"
 
 [tool.setuptools]
 packages = ["opencap_visualizer"]

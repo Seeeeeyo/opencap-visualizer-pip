@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-04-08
+
+### Added
+
+- **Realtime live streaming API** (same WebSocket protocol as the visualizer; no full precomputed JSON required for your own server):
+  - `build_live_init_dict`, `build_live_frame_dict` — construct `init` / `frame` message dicts.
+  - `send_live_init`, `send_live_frame`, `broadcast_live_frame` — async send helpers (`mesh_load_delay` on init, default 1.0s, use `0` for low latency).
+  - `skeleton_bodies_metadata`, `skeleton_bodies_from_visualizer_json` — skeleton metadata from visualizer `bodies` or a template file.
+- **Refactor**: file replay `stream_from_json` now uses the same builders so protocol output stays consistent.
+
+## [1.4.1] - 2026-04-08
+
+### Added
+
+- **Live stream CLI**: `--port N` when the default **8765** is already in use; clearer error if bind fails (`EADDRINUSE`).
+
+## [1.4.0] - 2026-04-08
+
+### Added
+
+- **Live IK WebSocket streaming** (same protocol as the OpenCap Visualizer “Live IK Stream” panel).
+  - Optional dependency: `pip install opencap-visualizer[live]` (installs `websockets`).
+  - CLI: `opencap-visualizer-stream` / `opencap-viz-stream` (same arguments as the repo’s `live_stream_from_json.py`).
+  - Python API: `stream_from_json`, `send_notification`, `send_camera`, `send_trial_scores`, and related helpers are exported from `opencap_visualizer`.
+  - Run as a module: `python -m opencap_visualizer.live_stream subject.json`.
+
 ## [1.3.0] - 2026-03-23
 
 ### ✨ Added

@@ -15,7 +15,7 @@ def example_basic_usage():
     
     # Simple video generation
     success = ocv.create_video(
-        "example_data.json", 
+        "data.json", 
         "basic_output.mp4",
         verbose=True
     )
@@ -38,7 +38,7 @@ def example_multiple_subjects():
         camera="anterior",  # Front-facing view
         colors=["red", "green", "blue"],  # Custom colors
         loops=2,  # Two animation loops
-        zoom=1.2,  # Slightly zoomed out
+        zoom=1.0,  # Standard view
         verbose=True
     )
     
@@ -58,14 +58,14 @@ def example_class_based():
     
     # Generate high-resolution video
     success = visualizer.generate_video_sync(
-        input_files="biomechanics_data.json",
+        input_files="data.json",
         output_path="high_res_output.mp4",
         width=3840,   # 4K width
         height=2160,  # 4K height
         camera="sagittal",  # Side profile view
         colors=["#ff6b35"],  # Custom orange color
         center_subjects=True,  # Auto-center camera
-        zoom=1.5  # Zoomed out view
+        zoom=1.2  # Slightly zoomed out view
     )
     
     if success:
@@ -81,7 +81,7 @@ async def example_async_usage():
     
     # Using the async convenience function
     success1 = await ocv.create_video_async(
-        "data1.json",
+        "data.json",
         "async_output1.mp4",
         camera="posterior",  # Back view
         colors=["blue"],
@@ -91,7 +91,7 @@ async def example_async_usage():
     # Using the class with async method
     visualizer = ocv.OpenCapVisualizer(verbose=True)
     success2 = await visualizer.generate_video(
-        ["data2.json", "data3.json"],
+        ["subject1.json", "subject2.json"],
         "async_comparison.mp4",
         camera="superior",  # Top-down view
         colors=["purple", "cyan"],
@@ -131,9 +131,9 @@ async def example_batch_processing():
     print("\n=== Example 6: Batch Processing ===")
     
     datasets = [
-        ("walking_trial1.json", "walking_1.mp4"),
-        ("walking_trial2.json", "walking_2.mp4"),
-        ("running_trial1.json", "running_1.mp4"),
+        ("subject1.json", "walking_1.mp4"),
+        ("subject2.json", "walking_2.mp4"),
+        ("subject3.json", "running_1.mp4"),
     ]
     
     visualizer = ocv.OpenCapVisualizer(verbose=True)
@@ -146,7 +146,7 @@ async def example_batch_processing():
             output_file,
             camera="sagittal",  # Side view for gait analysis
             colors=["red"],
-            zoom=1.3
+            zoom=1.0
         )
         results.append(success)
         
@@ -160,21 +160,43 @@ async def example_batch_processing():
     
     return results
 
+def example_multiple_file_types():
+    """Example 7: Multiple file types with markers and forces"""
+    print("\n=== Example 7: Multiple File Types ===")
+    
+    # Generate video from multiple file types (framework ready)
+    success = ocv.create_video(
+        # ["data.json", "markers.trc", "forces.mot"],
+        # "combined.mp4",
+        "sim.json",
+        "sim.mp4",
+        verbose=True
+    )
+    
+    if success:
+        print("✅ Combined multi-format video created!")
+    else:
+        print("❌ Multi-format video generation failed")
+    
+    return success
+
+
 def main():
     """Run all examples"""
     print("OpenCap Visualizer Python API Examples")
     print("=" * 40)
     
     # Run synchronous examples
-    example_basic_usage()
-    example_multiple_subjects() 
-    example_class_based()
-    example_opensim_files()
+    # example_basic_usage()
+    # example_multiple_subjects() 
+    # example_class_based()
+    # example_opensim_files()
+    example_multiple_file_types()
     
     # Run asynchronous examples
-    print("\n🔄 Running async examples...")
-    asyncio.run(example_async_usage())
-    asyncio.run(example_batch_processing())
+    # print("\n🔄 Running async examples...")
+    # asyncio.run(example_async_usage())
+    # asyncio.run(example_batch_processing())
     
     print("\n🎉 All examples completed!")
     print("\nNOTE: These examples assume you have valid data files.")

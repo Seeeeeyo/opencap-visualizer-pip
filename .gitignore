@@ -1,0 +1,28 @@
+# Environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+
+# Distribution (build with `python -m build`)
+dist/
+*.whl
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local scratch / large fixtures (not shipped)
+subject*.json
+model.osim
+motion.mot
+STS1.mot
+test_outputs/
+t.py
